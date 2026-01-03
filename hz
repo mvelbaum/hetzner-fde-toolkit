@@ -20,6 +20,7 @@ set -euo pipefail
 #   HZ_BOOT_WAIT        Max seconds for unlock+boot completion (default: 600)
 #   HZ_SSH_CMD          Override SSH binary (default: ssh)
 #   HZ_SCP_CMD          Override SCP binary (default: scp)
+#   HZ_AUTO_REMEDIATE   y = auto-accept host key prompts (for scripts); unset = prompt
 
 HZ_CONNECT_WAIT=${HZ_CONNECT_WAIT:-120}
 HZ_BOOT_WAIT=${HZ_BOOT_WAIT:-600}
@@ -453,25 +454,53 @@ hz_ssh_probe() {
     local host_alias=$3
     local cmd=$4
 
-    local ipv_flag
-    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+    local output=""
+    local ret=0
 
-    local output
-    # shellcheck disable=SC2086
-    output=$($HZ_SSH_CMD \
-        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
-        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
-        ${HZ_STRICT_KEYCHECK_OPT} \
-        -o BatchMode=yes \
-        -o ConnectTimeout=5 \
-        -o NumberOfPasswordPrompts=0 \
-        ${ipv_flag:++$ipv_flag} \
-        -o "HostName=$ip" \
-        -l "$user" \
-        "$host_alias" \
-        "$cmd" 2>&1)
+    # IMPORTANT: this function intentionally runs SSH expecting failures.
+    # We use a temporary file to safely capture stdout/stderr without
+    # command substitution potentially triggering set -e or subshell issues.
+    # We DO NOT use HZ_COMMON_SSH_ARGS, HZ_STRICT_KEYCHECK_OPT, or
+    # HZ_SSH_OPTS here because they might contain HostKeyAlias or
+    # other options that block the very error message we are trying to
+    # capture and classify.
+    local tmp
+    tmp=$(mktemp) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
 
-    local ret=$?
+    # In rDNS mode (HZ_SKIP_HOSTNAME_OVERRIDE=y), we connect via hostname directly
+    # (no HostName override) so that the probe mirrors what the actual SSH call does.
+    # Otherwise SSH might check hostkeys against a different target than the real call.
+    if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+        # shellcheck disable=SC2086
+        $HZ_SSH_CMD \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=5 \
+            -o NumberOfPasswordPrompts=0 \
+            -l "$user" \
+            "$host_alias" \
+            "$cmd" >"$tmp" 2>&1 || ret=$?
+    else
+        local ipv_flag
+        ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+        # shellcheck disable=SC2086
+        $HZ_SSH_CMD \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=5 \
+            -o NumberOfPasswordPrompts=0 \
+            ${ipv_flag:++$ipv_flag} \
+            -o "HostName=$ip" \
+            -l "$user" \
+            "$host_alias" \
+            "$cmd" >"$tmp" 2>&1 || ret=$?
+    fi
+
+    output=$(cat "$tmp")
+
     printf "%s" "$output"
     return $ret
 }
@@ -571,9 +600,13 @@ hz_remove_known_hosts_conflicts() {
         return 1
     fi
 
-    hz_remove_known_hosts_host "$file" "$ip" || true
+    # In rDNS mode we may be connecting via hostname (for ssh_config matching),
+    # so removing the IP entry doesn't help. We still remove it when we know it.
+    if [ -n "$ip" ]; then
+        hz_remove_known_hosts_host "$file" "$ip" || true
+    fi
 
-    if [ -n "$host_alias" ] && [ "$host_alias" != "$ip" ]; then
+    if [ -n "$host_alias" ]; then
         hz_remove_known_hosts_host "$file" "$host_alias" || true
     fi
 
@@ -649,12 +682,16 @@ hz_report_hostkey_failure() {
     local offending=""
     local line
     while IFS= read -r line; do
-        case "$line" in
-            Offending\ *\ key\ in\ *:[0-9]*)
-                offending=${line#Offending * key in }
+        # Strip all control characters (like \r) from the line to prevent parsing issues
+        line=$(printf "%s" "$line" | tr -d '\000-\037\177')
+        # Use sed to extract the file:line part.
+        # It looks for "key in " followed by a path ending in ":number"
+        if printf "%s" "$line" | grep -q "key in "; then
+            offending=$(printf "%s" "$line" | sed -n 's/.*key in \(.*:[0-9]\{1,\}\).*/\1/p')
+            if [ -n "$offending" ]; then
                 break
-                ;;
-        esac
+            fi
+        fi
     done <<<"$probe_out"
 
     if [ -n "$offending" ]; then
@@ -665,7 +702,7 @@ hz_report_hostkey_failure() {
 
         # Offer to remove the offending line. Note this can happen multiple times if
         # the same host has multiple keys in known_hosts (e.g. old ECDSA + old ED25519).
-        if [ "${HZ_SSH_STRICT}" != "n" ] && hz_have_tty; then
+        if [ "${HZ_SSH_STRICT}" != "n" ] && { hz_have_tty || [ "${HZ_AUTO_REMEDIATE:-}" = "y" ]; }; then
             local file=${offending%:*}
             local line_no=${offending##*:}
 
@@ -678,7 +715,11 @@ hz_report_hostkey_failure() {
                 : # prompt only
 
                 local confirm=""
-                read -r -p "Remove this and any subsequent known_hosts conflicts (and retry)? (Y/n): " confirm </dev/tty
+                if [ "${HZ_AUTO_REMEDIATE:-}" = "y" ]; then
+                    confirm="y"
+                else
+                    read -r -p "Remove this and any subsequent known_hosts conflicts (and retry)? (Y/n): " confirm </dev/tty
+                fi
                 confirm=${confirm:-y}
 
                 if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
@@ -698,7 +739,7 @@ hz_report_hostkey_failure() {
         fi
     fi
 
-    if [ "${HZ_SSH_STRICT}" != "n" ] && hz_have_tty && [ "${HZ_HOSTKEY_ACCEPT_NEW:-}" != "y" ]; then
+    if [ "${HZ_SSH_STRICT}" != "n" ] && { hz_have_tty || [ "${HZ_AUTO_REMEDIATE:-}" = "y" ]; } && [ "${HZ_HOSTKEY_ACCEPT_NEW:-}" != "y" ]; then
         local hostkey_line
         hostkey_line=$(hz_fetch_first_hostkey "$ip" || true)
 
@@ -713,7 +754,11 @@ hz_report_hostkey_failure() {
         fi
 
         local confirm=""
-        read -r -p "Accept new host key and retry? (Y/n): " confirm </dev/tty
+        if [ "${HZ_AUTO_REMEDIATE:-}" = "y" ]; then
+            confirm="y"
+        else
+            read -r -p "Accept new host key and retry? (Y/n): " confirm </dev/tty
+        fi
         confirm=${confirm:-y}
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             HZ_HOSTKEY_ACCEPT_NEW=y
@@ -881,8 +926,9 @@ hz_unlock_and_wait() {
         fi
 
         # Classify errors periodically so we don't spin forever on key/hostkey issues.
+        # NOTE: probes return non-zero (the ssh exit code), so we guard with || true.
         local user_probe
-        user_probe=$(hz_ssh_probe "$ip" "$HZ_INTENDED_USER" "$HZ_HOST_ALIAS" "true" || true)
+        user_probe=$(hz_ssh_probe "$ip" "$HZ_INTENDED_USER" "$HZ_HOST_ALIAS" "true") || true
         if printf "%s" "$user_probe" | grep -qiE 'host key verification failed|remote host identification has changed'; then
             if hz_report_hostkey_failure "$user_probe" "$ip"; then
                 continue
@@ -895,7 +941,7 @@ hz_unlock_and_wait() {
 
         hz_have_tty && hz_note "probing SSH as 'root'..."
         local root_probe
-        root_probe=$(hz_ssh_probe "$ip" "root" "$HZ_HOST_ALIAS" "true" || true)
+        root_probe=$(hz_ssh_probe "$ip" "root" "$HZ_HOST_ALIAS" "true") || true
         if printf "%s" "$root_probe" | grep -qiE 'host key verification failed|remote host identification has changed'; then
             if hz_report_hostkey_failure "$root_probe" "$ip"; then
                 continue
@@ -1033,6 +1079,7 @@ Environment variables:
   HZ_BOOT_WAIT          Max seconds for unlock+boot (default: 600)
   HZ_RESET_ON_CRYPTFAIL y = auto-reset on crypt fail; n = fail; unset = prompt
   HZ_RESET_MAX          Max resets per run (default: 1)
+  HZ_AUTO_REMEDIATE     y = auto-accept host key prompts (for scripts)
   HZ_SSH_CMD            Override SSH binary (default: ssh)
   HZ_SCP_CMD            Override SCP binary (default: scp)
 
@@ -1069,10 +1116,6 @@ hz_cmd_ssh() {
         exit 1
     fi
 
-    hz_build_ssh_common_args
-
-    local connect_ip=""
-
     # If hcloud lookup fails, fall back to the host as provided.
     if hz_resolve_hcloud_ips "$HZ_HOST_ALIAS"; then
         if ! hz_select_connect_ip "$HZ_FORCED_FAMILY"; then
@@ -1089,7 +1132,7 @@ hz_cmd_ssh() {
                 HZ_DEST_TOKEN="${HZ_INTENDED_USER}@${rdns_host}"
                 HZ_HOST_ALIAS=$rdns_host
                 # Let SSH resolve the rDNS hostname naturally (no HostName override)
-                # This allows SSH config matching to work properly
+                # so user ssh_config patterns (ForwardAgent, ProxyJump, etc.) match.
                 HZ_SKIP_HOSTNAME_OVERRIDE=y
             fi
         fi
@@ -1116,70 +1159,94 @@ hz_cmd_ssh() {
         fi
     fi
 
+    # Build common SSH arguments now that names/IPs are resolved.
+    hz_build_ssh_common_args
+
     # Run the SSH command directly (without exec) so we can check for LUKS unlock.
     # If it fails with exit code 255, enter unlock flow and retry.
     local ipv_flag
     ipv_flag=$(hz_ssh_ipv_flag "$connect_ip")
 
     local ssh_ret=0
-    set +e
-    if [ ${#HZ_REMOTE_CMD[@]} -eq 0 ]; then
-        # Interactive session - run without exec so we can retry on LUKS
-        # shellcheck disable=SC2086
-        if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
-            $HZ_SSH_CMD \
-                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
-                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
-                "$HZ_DEST_TOKEN"
+    while true; do
+        set +e
+        if [ ${#HZ_REMOTE_CMD[@]} -eq 0 ]; then
+            # Interactive session
+            # We must use a direct SSH call for interactive sessions.
+            if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+                $HZ_SSH_CMD \
+                    ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                    ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                    "$HZ_DEST_TOKEN"
+            else
+                $HZ_SSH_CMD \
+                    ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                    ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                    ${ipv_flag:++$ipv_flag} \
+                    -o "HostName=$connect_ip" \
+                    "$HZ_DEST_TOKEN"
+            fi
+            ssh_ret=$?
         else
-            $HZ_SSH_CMD \
-                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
-                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
-                ${ipv_flag:++$ipv_flag} \
-                -o "HostName=$connect_ip" \
-                "$HZ_DEST_TOKEN"
+            # Non-interactive
+            if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+                $HZ_SSH_CMD \
+                    ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                    ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                    ${HZ_STRICT_KEYCHECK_OPT} \
+                    -o BatchMode=yes \
+                    -o ConnectTimeout=10 \
+                    "$HZ_DEST_TOKEN" \
+                    "${HZ_REMOTE_CMD[@]}"
+            else
+                $HZ_SSH_CMD \
+                    ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                    ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                    ${HZ_STRICT_KEYCHECK_OPT} \
+                    -o BatchMode=yes \
+                    -o ConnectTimeout=10 \
+                    ${ipv_flag:++$ipv_flag} \
+                    -o "HostName=$connect_ip" \
+                    "$HZ_DEST_TOKEN" \
+                    "${HZ_REMOTE_CMD[@]}"
+            fi
+            ssh_ret=$?
         fi
-        ssh_ret=$?
-    else
-        # Non-interactive: run the actual command
-        # shellcheck disable=SC2086
-        if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
-            $HZ_SSH_CMD \
-                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
-                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
-                ${HZ_STRICT_KEYCHECK_OPT} \
-                -o BatchMode=yes \
-                -o ConnectTimeout=10 \
-                "$HZ_DEST_TOKEN" \
-                "${HZ_REMOTE_CMD[@]}"
-        else
-            $HZ_SSH_CMD \
-                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
-                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
-                ${HZ_STRICT_KEYCHECK_OPT} \
-                -o BatchMode=yes \
-                -o ConnectTimeout=10 \
-                ${ipv_flag:++$ipv_flag} \
-                -o "HostName=$connect_ip" \
-                "$HZ_DEST_TOKEN" \
-                "${HZ_REMOTE_CMD[@]}"
+        set -e
+
+        # Success: done
+        if [ $ssh_ret -eq 0 ]; then
+            break
         fi
-        ssh_ret=$?
-    fi
-    set -e
 
-    # Success or non-connection error: done
-    if [ $ssh_ret -ne 255 ]; then
-        exit $ssh_ret
-    fi
+        # Exit code 255 means SSH connection/auth failure - could be LUKS or hostkey.
+        # Any other non-zero exit code is from the remote command/shell, so pass it through.
+        if [ $ssh_ret -ne 255 ]; then
+            exit $ssh_ret
+        fi
 
-    # Exit code 255: connection/auth/hostkey error. Attempt unlock flow.
-    hz_have_tty && hz_note "SSH connection failed, checking for LUKS unlock prompt..."
-    if ! hz_unlock_and_wait "$connect_ip"; then
-        exit 1
-    fi
+        # Explicitly probe to classify the 255 error.
+        # NOTE: probe returns non-zero (the ssh exit code), so we must guard
+        # against set -e aborting on the command substitution.
+        local probe_out
+        probe_out=$(hz_ssh_probe "$connect_ip" "$HZ_INTENDED_USER" "$HZ_HOST_ALIAS" "true") || true
+        if printf "%s" "$probe_out" | grep -qiE 'host key verification failed|remote host identification has changed'; then
+            if ! hz_report_hostkey_failure "$probe_out" "$connect_ip"; then
+                exit 1
+            fi
+            # Re-build common args (in case keys were removed/accepted) and retry the loop.
+            hz_build_ssh_common_args
+            continue
+        fi
 
-    hz_exec_user_ssh "$connect_ip"
+        # Exit code 255 and not a host key error: likely LUKS or connectivity.
+        hz_have_tty && hz_note "SSH connection failed, checking for LUKS unlock prompt..."
+        if ! hz_unlock_and_wait "$connect_ip"; then
+            exit 1
+        fi
+
+        # Unlock succeeded, the loop will retry the actual SSH call.
+    done
 }
 
 # Parse a remote path in scp format: [user@]host:path
