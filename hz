@@ -1,0 +1,1509 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Compatibility: This script must run on macOS's system bash
+# (GNU bash, version 3.2.57(1)-release) as well as Linux.
+# Avoid bash 4+ features (e.g. associative arrays).
+
+# hz - SSH/SCP into Hetzner VM with auto-unlock LUKS support
+#
+# Usage:
+#   hz ssh [ssh_args...] [user@]server [remote_command...]
+#   hz scp [scp_args...] source... destination
+#
+# Env vars:
+#   HZ_LUKS_UNLOCK      LUKS passphrase OR 1Password ref: op://<vault>/<item>/<field> or op://<vault> (short form)
+#   HZ_OP_ACCOUNT       Optional 1Password account selector
+#   HZ_SSH_STRICT       y (default) uses normal known_hosts; n disables hostkey checking
+#   HZ_RDNS             n (default) use VM name; y = use rDNS hostname for SSH config matching
+#   HZ_CONNECT_WAIT     Seconds to wait for TCP/22 (default: 120)
+#   HZ_BOOT_WAIT        Max seconds for unlock+boot completion (default: 600)
+#   HZ_SSH_CMD          Override SSH binary (default: ssh)
+#   HZ_SCP_CMD          Override SCP binary (default: scp)
+
+HZ_CONNECT_WAIT=${HZ_CONNECT_WAIT:-120}
+HZ_BOOT_WAIT=${HZ_BOOT_WAIT:-600}
+HZ_SSH_STRICT=${HZ_SSH_STRICT:-y}
+
+# HZ_SSH_CMD: Override the SSH binary (default: ssh)
+HZ_SSH_CMD=${HZ_SSH_CMD:-ssh}
+HZ_SCP_CMD=${HZ_SCP_CMD:-scp}
+HZ_SSH_KEYSCAN_CMD=${HZ_SSH_KEYSCAN_CMD:-ssh-keyscan}
+HZ_SSH_KEYGEN_CMD=${HZ_SSH_KEYGEN_CMD:-ssh-keygen}
+
+# HZ_RESET_ON_CRYPTFAIL:
+#   unset: prompt when cryptsetup fails
+#   y: auto-reset without prompting
+#   n: fail without resetting
+HZ_RESET_ON_CRYPTFAIL=${HZ_RESET_ON_CRYPTFAIL:-}
+
+# Max number of automatic resets per run (guards against loops)
+HZ_RESET_MAX=${HZ_RESET_MAX:-1}
+
+# HZ_RDNS: use reverse DNS for SSH destination (for SSH config matching)
+#   n (default): use VM name as-is (e.g. myuser@hetzner-vm)
+#   y: use rDNS hostname if available (e.g. myuser@hetzner.example.com)
+HZ_RDNS=${HZ_RDNS:-n}
+
+hz_err() {
+    printf "hz: %s\n" "$*" >&2
+}
+
+hz_note() {
+    printf "hz: %s\n" "$*" >&2
+}
+
+hz_warn() {
+    printf "hz: warning: %s\n" "$*" >&2
+}
+
+hz_have_tty() {
+    if [ -t 0 ]; then
+        return 0
+    fi
+
+    if [ -c /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+hz_require_cmd() {
+    local cmd=$1
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        hz_err "missing required tool: $cmd"
+        return 1
+    fi
+}
+
+
+hz_nc_ipv_flag() {
+    local ip=$1
+    if [[ "$ip" == *":"* ]]; then
+        printf -- "-6"
+    else
+        printf -- "-4"
+    fi
+}
+
+hz_ssh_ipv_flag() {
+    local ip=$1
+    if [[ "$ip" == *":"* ]]; then
+        printf -- "-6"
+    else
+        printf -- ""
+    fi
+}
+
+hz_strip_brackets() {
+    local v=$1
+    v=${v#[[]}
+    v=${v%]}
+    printf "%s" "$v"
+}
+
+hz_wait_for_port() {
+    local ip=$1
+    local max_wait=$2
+
+    local nc_flag
+    nc_flag=$(hz_nc_ipv_flag "$ip")
+
+    local start_time
+    start_time=$(date +%s)
+
+    while [ $(($(date +%s) - start_time)) -lt "$max_wait" ]; do
+        if nc "$nc_flag" -z -w 3 "$ip" 22 >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+
+    return 1
+}
+
+hz_op_cmd() {
+    if [ -n "${HZ_OP_ACCOUNT:-}" ]; then
+        op --account "$HZ_OP_ACCOUNT" "$@"
+    else
+        op "$@"
+    fi
+}
+
+hz_trim_quotes() {
+    # Remove surrounding single/double quotes (common when pasting).
+    local v=$1
+
+    if [ ${#v} -ge 2 ]; then
+        local first=${v:0:1}
+        local last=${v: -1}
+        if [ "$first" = "\"" ] && [ "$last" = "\"" ]; then
+            v=${v:1:${#v}-2}
+        elif [ "$first" = "'" ] && [ "$last" = "'" ]; then
+            v=${v:1:${#v}-2}
+        fi
+    fi
+
+    printf "%s" "$v"
+}
+
+hz_read_luks_passphrase() {
+    local input=${HZ_LUKS_UNLOCK:-}
+
+    # Back-compat: support the old env var name.
+    if [ -z "$input" ] && [ -n "${HZ_LUKS_SECRET_REF:-}" ]; then
+        input=${HZ_LUKS_SECRET_REF}
+    fi
+
+    if [ -z "$input" ]; then
+        if ! hz_have_tty; then
+            hz_err "HZ_LUKS_UNLOCK is not set and no TTY is available"
+            hz_err "set HZ_LUKS_UNLOCK to a passphrase or an op reference (example: op://<vault>/<item>/LUKS password)"
+            return 1
+        fi
+
+        # Use readline so arrow keys/editing work.
+        # -s avoids echoing the passphrase; it's fine for op:// refs too.
+        read -r -s -e -p "Enter LUKS passphrase or op:// reference: " input </dev/tty
+        printf "\n" >/dev/tty
+        if [ -z "$input" ]; then
+            hz_err "LUKS unlock value cannot be empty"
+            return 1
+        fi
+    fi
+
+    input=$(hz_trim_quotes "$input")
+
+    if [[ "$input" == op://* ]]; then
+        # Expand short-form op://<vault> to op://<vault>/<server>/luks-password
+        local slash_count
+        slash_count=$(awk -F'/' '{print NF-1}' <<<"$input")
+        if [ "$slash_count" -eq 2 ]; then
+            # op://<vault> -> op://<vault>/<server>/luks-password
+            input="${input}/${HZ_HOST_ALIAS}/luks-password"
+            hz_have_tty && hz_note "expanded op:// ref to: $input"
+        fi
+
+        local pass
+        # Capture only stdout (the secret); let stderr through for interactive UX.
+        # With 1Password desktop app integration, this triggers biometric auth automatically.
+        # In CI/headless environments, OP_SERVICE_ACCOUNT_TOKEN must be set.
+        if pass=$(hz_op_cmd read "$input"); then
+            printf "%s" "$pass"
+            return 0
+        fi
+
+        hz_err "failed to read LUKS passphrase via op"
+        hz_err "if using 1Password desktop app, authenticate when prompted"
+        hz_err "for CI/headless environments, set OP_SERVICE_ACCOUNT_TOKEN"
+        return 1
+    fi
+
+    # Treat as raw passphrase.
+    printf "%s" "$input"
+    return 0
+}
+
+hz_parse_ssh_args() {
+    # Populates globals:
+    #   HZ_SSH_OPTS[]      - args before destination
+    #   HZ_REMOTE_CMD[]    - args after destination
+    #   HZ_DEST_TOKEN      - destination token (as provided)
+    #   HZ_HOST_ALIAS      - host portion without user
+    #   HZ_INTENDED_USER   - user (from user@host, -l, or $USER)
+    #   HZ_FORCED_FAMILY   - "-4" | "-6" | ""
+
+    HZ_SSH_OPTS=()
+    HZ_REMOTE_CMD=()
+    HZ_DEST_TOKEN=""
+    HZ_HOST_ALIAS=""
+    HZ_INTENDED_USER=""
+    HZ_FORCED_FAMILY=""
+
+    local opt_user=""
+    local expect_arg=""
+
+    local args=("$@")
+    local i=0
+
+    while [ $i -lt ${#args[@]} ]; do
+        local a=${args[$i]}
+
+        if [ -n "$expect_arg" ]; then
+            HZ_SSH_OPTS+=("$a")
+            if [ "$expect_arg" = "-l" ]; then
+                opt_user=$a
+            fi
+            expect_arg=""
+            ((i++))
+            continue
+        fi
+
+        case "$a" in
+            -4|-6)
+                HZ_FORCED_FAMILY=$a
+                HZ_SSH_OPTS+=("$a")
+                ;;
+            -l)
+                HZ_SSH_OPTS+=("$a")
+                expect_arg="-l"
+                ;;
+            -l*)
+                # -luser form
+                HZ_SSH_OPTS+=("$a")
+                opt_user=${a#-l}
+                ;;
+            -b|-c|-D|-E|-e|-F|-I|-i|-J|-L|-m|-O|-o|-p|-Q|-R|-S|-W|-w|-B)
+                HZ_SSH_OPTS+=("$a")
+                expect_arg="$a"
+                ;;
+            -b*|-c*|-D*|-E*|-e*|-F*|-I*|-i*|-J*|-L*|-m*|-O*|-o*|-p*|-Q*|-R*|-S*|-W*|-w*|-B*)
+                HZ_SSH_OPTS+=("$a")
+                ;;
+            --)
+                # End of options; next argument is destination.
+                HZ_SSH_OPTS+=("$a")
+                ((i++))
+                if [ $i -ge ${#args[@]} ]; then
+                    break
+                fi
+                HZ_DEST_TOKEN=${args[$i]}
+                ((i++))
+                break
+                ;;
+            -*)
+                HZ_SSH_OPTS+=("$a")
+                ;;
+            *)
+                HZ_DEST_TOKEN=$a
+                ((i++))
+                break
+                ;;
+        esac
+
+        ((i++))
+    done
+
+    if [ -z "$HZ_DEST_TOKEN" ]; then
+        return 1
+    fi
+
+    if [ $i -lt ${#args[@]} ]; then
+        HZ_REMOTE_CMD=("${args[@]:$i}")
+    fi
+
+    local dest=$HZ_DEST_TOKEN
+    local user_from_dest=""
+    local host_from_dest=$dest
+
+    if [[ "$dest" == *"@"* ]]; then
+        user_from_dest=${dest%%@*}
+        host_from_dest=${dest#*@}
+    fi
+
+    host_from_dest=$(hz_strip_brackets "$host_from_dest")
+
+    if [ -n "$user_from_dest" ]; then
+        HZ_INTENDED_USER=$user_from_dest
+    elif [ -n "$opt_user" ]; then
+        HZ_INTENDED_USER=$opt_user
+    else
+        HZ_INTENDED_USER=${USER:-}
+    fi
+
+    if [ -z "$HZ_INTENDED_USER" ]; then
+        hz_err "could not determine intended user (USER is empty)"
+        return 1
+    fi
+
+    HZ_HOST_ALIAS=$host_from_dest
+
+    return 0
+}
+
+hz_resolve_hcloud_ips() {
+    local host_alias=$1
+
+    HZ_TARGET_NAME="$host_alias"
+    HZ_SERVER_ID=""
+    HZ_IPV4=""
+    HZ_IPV6_ADDR=""
+
+    local json
+    if ! json=$(hcloud server describe "$host_alias" -o json 2>/dev/null); then
+        return 1
+    fi
+
+    # shellcheck disable=SC2034
+    HZ_SERVER_ID=$(jq -r '.id // empty' <<<"$json")
+
+    HZ_TARGET_NAME=$(jq -r '.name // empty' <<<"$json")
+    if [ -z "$HZ_TARGET_NAME" ]; then
+        HZ_TARGET_NAME=$host_alias
+    fi
+
+    HZ_IPV4=$(jq -r '.public_net.ipv4.ip // empty' <<<"$json")
+
+    local ipv6_net
+    ipv6_net=$(jq -r '.public_net.ipv6.ip // empty' <<<"$json")
+    if [ -n "$ipv6_net" ]; then
+        HZ_IPV6_ADDR="${ipv6_net%%/*}1"
+    fi
+
+    return 0
+}
+
+
+hz_select_connect_ip() {
+    local forced_family=$1
+
+    local candidates=()
+    if [ "$forced_family" = "-6" ]; then
+        [ -n "$HZ_IPV6_ADDR" ] && candidates+=("$HZ_IPV6_ADDR")
+    elif [ "$forced_family" = "-4" ]; then
+        [ -n "$HZ_IPV4" ] && candidates+=("$HZ_IPV4")
+    else
+        [ -n "$HZ_IPV4" ] && candidates+=("$HZ_IPV4")
+        [ -n "$HZ_IPV6_ADDR" ] && candidates+=("$HZ_IPV6_ADDR")
+    fi
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+        hz_err "no public IP found (IPv4/IPv6)"
+        return 1
+    fi
+
+    # Just pick the first candidate; don't wait for port here.
+    # SSH will fail fast if port is closed, and unlock flow handles waiting.
+    HZ_CONNECT_IP=${candidates[0]}
+    return 0
+}
+
+hz_rdns_lookup() {
+    # Lookup reverse DNS for an IP. Returns the hostname or empty string.
+    local ip=$1
+    local output
+    if ! output=$(host "$ip" 2>/dev/null); then
+        return 1
+    fi
+    # Parse: "X.X.X.X.in-addr.arpa domain name pointer hostname."
+    # or for IPv6: "... domain name pointer hostname."
+    local hostname
+    hostname=$(awk '/domain name pointer/ {print $NF}' <<<"$output" | head -1)
+    # Remove trailing dot
+    hostname=${hostname%.}
+    if [ -n "$hostname" ]; then
+        printf "%s" "$hostname"
+        return 0
+    fi
+    return 1
+}
+
+hz_build_ssh_common_args() {
+    # Args common to all ssh calls, including strict/relaxed hostkey behavior.
+    # NOTE: With `set -u`, expanding an empty array like "${arr[@]}" errors.
+    # We therefore always expand arrays using the `${arr[@]+"${arr[@]}"}` idiom.
+    HZ_COMMON_SSH_ARGS=()
+
+    # For any non-interactive SSH call, ensure we never block on host key prompts.
+    # In strict mode, this makes unknown hosts fail fast so we can show our own prompt.
+    HZ_STRICT_KEYCHECK_OPT=""
+
+    if [ "${HZ_SSH_STRICT}" = "n" ]; then
+        HZ_COMMON_SSH_ARGS+=(
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+        )
+    else
+        HZ_STRICT_KEYCHECK_OPT="-o StrictHostKeyChecking=yes"
+    fi
+}
+
+hz_ssh_run() {
+    # Non-interactive ssh call helper.
+    # Usage: hz_ssh_run <ip> <user> <host_alias> <command>
+    local ip=$1
+    local user=$2
+    local host_alias=$3
+    local cmd=$4
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    # shellcheck disable=SC2086
+    $HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        ${HZ_STRICT_KEYCHECK_OPT} \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        -l "$user" \
+        "$host_alias" \
+        "$cmd"
+}
+
+hz_ssh_probe() {
+    # Like hz_ssh_run, but captures output for error classification.
+    # Usage: hz_ssh_probe <ip> <user> <host_alias> <command>
+    local ip=$1
+    local user=$2
+    local host_alias=$3
+    local cmd=$4
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    local output
+    # shellcheck disable=SC2086
+    output=$($HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        ${HZ_STRICT_KEYCHECK_OPT} \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        -l "$user" \
+        "$host_alias" \
+        "$cmd" 2>&1)
+
+    local ret=$?
+    printf "%s" "$output"
+    return $ret
+}
+
+hz_can_login_user() {
+    local ip=$1
+    hz_ssh_run "$ip" "$HZ_INTENDED_USER" "$HZ_HOST_ALIAS" "true" >/dev/null 2>&1
+}
+
+hz_can_login_root() {
+    local ip=$1
+    hz_ssh_run "$ip" "root" "$HZ_HOST_ALIAS" "true" >/dev/null 2>&1
+}
+
+hz_check_unlocked_mapper() {
+    local ip=$1
+    hz_ssh_run "$ip" "root" "$HZ_HOST_ALIAS" "ls /dev/mapper/vg0-root" >/dev/null 2>&1
+}
+
+hz_find_askpass_socket() {
+    local ip=$1
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    # NOTE: Must use single quotes to prevent local shell expansion.
+    # Use bash -lc remotely to avoid zsh globbing issues.
+    # shellcheck disable=SC2086,SC2016
+    $HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        root@"$HZ_HOST_ALIAS" \
+        'bash -lc '\''for s in /run/systemd/ask-password/sck.*; do [ -S "$s" ] || continue; echo "$s"; break; done'\''' \
+        2>/dev/null || true
+}
+
+hz_remove_known_hosts_line() {
+    local file=$1
+    local line_no=$2
+
+    if [ -z "$file" ] || [ -z "$line_no" ]; then
+        return 1
+    fi
+
+    if [ ! -f "$file" ]; then
+        hz_err "known_hosts file not found: $file"
+        return 1
+    fi
+
+    case "$line_no" in
+        ''|*[!0-9]*)
+            hz_err "invalid known_hosts line number: $line_no"
+            return 1
+            ;;
+    esac
+
+    local tmp
+    tmp=$(mktemp) || return 1
+
+    awk -v n="$line_no" 'NR != n { print }' "$file" >"$tmp"
+
+    mv "$tmp" "$file"
+    return 0
+}
+
+hz_remove_known_hosts_host() {
+    # Remove all entries for a host from known_hosts.
+    # Uses ssh-keygen -R so hashed/multi-key entries are handled.
+    local file=$1
+    local host=$2
+
+    if [ -z "$file" ] || [ -z "$host" ]; then
+        return 1
+    fi
+
+    if [ ! -f "$file" ]; then
+        hz_err "known_hosts file not found: $file"
+        return 1
+    fi
+
+    $HZ_SSH_KEYGEN_CMD -R "$host" -f "$file" >/dev/null 2>&1 || true
+    return 0
+}
+
+hz_remove_known_hosts_conflicts() {
+    # Remove all known_hosts entries that can conflict for this connection.
+    local file=$1
+    local ip=$2
+    local host_alias=$3
+
+    if [ -z "$file" ]; then
+        return 1
+    fi
+
+    hz_remove_known_hosts_host "$file" "$ip" || true
+
+    if [ -n "$host_alias" ] && [ "$host_alias" != "$ip" ]; then
+        hz_remove_known_hosts_host "$file" "$host_alias" || true
+    fi
+
+    # Ensure we re-prompt to accept the new key after wiping old entries.
+    HZ_HOSTKEY_ACCEPT_NEW=
+    return 0
+}
+
+hz_fetch_first_hostkey() {
+    local ip=$1
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    # ssh-keyscan outputs: "host keytype base64" (plus comment lines starting with #).
+    # Use a short timeout and return the first actual key only.
+    # shellcheck disable=SC2086
+    $HZ_SSH_KEYSCAN_CMD \
+        ${ipv_flag:++$ipv_flag} \
+        -T 5 \
+        "$ip" 2>/dev/null \
+        | awk '/^[^#]/ && NF >= 3 { print $1" "$2" "$3; exit }'
+}
+
+hz_hostkey_fingerprint() {
+    local hostkey_line=$1
+
+    # Example output:
+    # 256 SHA256:... host (ED25519)
+    local fp
+    fp=$($HZ_SSH_KEYGEN_CMD -lf - <<<"$hostkey_line" 2>/dev/null | awk '{print $2" "$4}')
+    printf "%s" "$fp"
+}
+
+hz_accept_new_hostkey() {
+    local ip=$1
+
+    if [ "${HZ_SSH_STRICT}" = "n" ]; then
+        return 1
+    fi
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    # Use StrictHostKeyChecking=accept-new to add the current host key to known_hosts.
+    # Auth may still fail; the goal is just to record the host key.
+    # shellcheck disable=SC2086
+    $HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        -o StrictHostKeyChecking=accept-new \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        root@"$HZ_HOST_ALIAS" \
+        "true" \
+        >/dev/null 2>&1 || true
+
+    # After accepting a new hostkey, restore strict checking behavior.
+    HZ_STRICT_KEYCHECK_OPT="-o StrictHostKeyChecking=yes"
+
+    return 0
+}
+
+hz_report_hostkey_failure() {
+    local probe_out=$1
+    local ip=$2
+
+    hz_err "host key verification failed"
+
+    local offending=""
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            Offending\ *\ key\ in\ *:[0-9]*)
+                offending=${line#Offending * key in }
+                break
+                ;;
+        esac
+    done <<<"$probe_out"
+
+    if [ -n "$offending" ]; then
+        hz_err "offending known_hosts entry: $offending"
+
+        # After removing old keys, SSH may prompt to trust the new key.
+        # We keep strict mode, but offer to accept-new and continue.
+
+        # Offer to remove the offending line. Note this can happen multiple times if
+        # the same host has multiple keys in known_hosts (e.g. old ECDSA + old ED25519).
+        if [ "${HZ_SSH_STRICT}" != "n" ] && hz_have_tty; then
+            local file=${offending%:*}
+            local line_no=${offending##*:}
+
+            # SSH output can include CRLF; strip whitespace.
+            file=$(printf "%s" "$file" | tr -d '\r\n')
+            line_no=$(printf "%s" "$line_no" | tr -d '\r\n[:space:]')
+
+            # If the user already approved removal once, keep going without reprompting.
+            if [ "${HZ_HOSTKEY_AUTO_REMOVE:-}" != "y" ]; then
+                : # prompt only
+
+                local confirm=""
+                read -r -p "Remove this and any subsequent known_hosts conflicts (and retry)? (Y/n): " confirm </dev/tty
+                confirm=${confirm:-y}
+
+                if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                    HZ_HOSTKEY_AUTO_REMOVE=y
+                else
+                    HZ_HOSTKEY_AUTO_REMOVE=n
+                fi
+            fi
+
+            if [ "${HZ_HOSTKEY_AUTO_REMOVE}" = "y" ]; then
+                hz_remove_known_hosts_conflicts "$file" "$ip" "$HZ_HOST_ALIAS"
+                hz_note "removed known_hosts entries for host; retrying"
+                return 0
+            fi
+
+            # If we couldn't remove, fall through to help message.
+        fi
+    fi
+
+    if [ "${HZ_SSH_STRICT}" != "n" ] && hz_have_tty && [ "${HZ_HOSTKEY_ACCEPT_NEW:-}" != "y" ]; then
+        local hostkey_line
+        hostkey_line=$(hz_fetch_first_hostkey "$ip" || true)
+
+        if [ -n "$hostkey_line" ]; then
+            local key_type
+            key_type=$(awk '{print $2}' <<<"$hostkey_line")
+            local fp
+            fp=$(hz_hostkey_fingerprint "$hostkey_line")
+            if [ -n "$fp" ]; then
+                hz_note "new host key: $key_type $fp"
+            fi
+        fi
+
+        local confirm=""
+        read -r -p "Accept new host key and retry? (Y/n): " confirm </dev/tty
+        confirm=${confirm:-y}
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+            HZ_HOSTKEY_ACCEPT_NEW=y
+            # Add the key directly to known_hosts (faster than another SSH roundtrip)
+            if [ -n "$hostkey_line" ]; then
+                local known_hosts_file
+                known_hosts_file="$HOME/.ssh/known_hosts"
+                local known_hosts_dir
+                known_hosts_dir=$(dirname "$known_hosts_file")
+                mkdir -p "$known_hosts_dir"
+                echo "$hostkey_line" >> "$known_hosts_file"
+                if [ -n "$HZ_HOST_ALIAS" ] && [ "$HZ_HOST_ALIAS" != "$ip" ]; then
+                    echo "$HZ_HOST_ALIAS ${hostkey_line#* }" >> "$known_hosts_file"
+                fi
+                HZ_STRICT_KEYCHECK_OPT="-o StrictHostKeyChecking=yes"
+            else
+                # Fallback to SSH method if we don't have the key line
+                hz_accept_new_hostkey "$ip"
+            fi
+            return 0
+        fi
+
+        # User explicitly declined
+        hz_err "host key not accepted"
+        return 1
+    fi
+
+    hz_err "fix ~/.ssh/known_hosts or set HZ_SSH_STRICT=n"
+    return 1
+}
+
+hz_cryptsetup_failed_output() {
+    local ip=$1
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    local out
+    # shellcheck disable=SC2086
+    out=$($HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        root@"$HZ_HOST_ALIAS" \
+        "systemctl --no-pager --failed" 2>/dev/null || true)
+
+    printf "%s" "$out"
+}
+
+hz_cryptsetup_unit_failed() {
+    local ip=$1
+
+    local out
+    out=$(hz_cryptsetup_failed_output "$ip")
+
+    if printf "%s" "$out" | grep -q 'systemd-cryptsetup@'; then
+        return 0
+    fi
+
+    return 1
+}
+
+hz_send_unlock() {
+    local ip=$1
+    local socket_path=$2
+    local luks_pass=$3
+
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+    # shellcheck disable=SC2086
+    $HZ_SSH_CMD \
+        ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+        ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=0 \
+        ${ipv_flag:++$ipv_flag} \
+        -o "HostName=$ip" \
+        root@"$HZ_HOST_ALIAS" \
+        "/usr/lib/systemd/systemd-reply-password 1 '$socket_path'" \
+        <<<"$luks_pass" \
+        >/dev/null 2>&1 || true
+}
+
+hz_reset_server() {
+    local target=${1:-}
+
+    if [ -z "$target" ]; then
+        return 1
+    fi
+
+    if [ "${HZ_RESET_COUNT:-0}" -ge "$HZ_RESET_MAX" ]; then
+        hz_err "reset limit reached (HZ_RESET_MAX=$HZ_RESET_MAX)"
+        return 1
+    fi
+
+    local mode=${HZ_RESET_ON_CRYPTFAIL:-}
+    local confirm=""
+
+    if [ -z "$mode" ]; then
+        if ! hz_have_tty; then
+            hz_err "HZ_RESET_ON_CRYPTFAIL is unset and no TTY is available to prompt"
+            hz_err "set HZ_RESET_ON_CRYPTFAIL=y to auto-reset, or n to fail"
+            return 1
+        fi
+
+        # Prompt once per run. If the user accepts, auto-reset on later failures.
+        local prompt_state=${HZ_RESET_PROMPT_ACCEPTED:-}
+        if [ "$prompt_state" != "y" ]; then
+            read -r -p "Reset server '$target' now? (Y/n): " confirm </dev/tty
+            confirm=${confirm:-y}
+            if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+                hz_err "reset cancelled"
+                return 1
+            fi
+            HZ_RESET_PROMPT_ACCEPTED=y
+        fi
+    elif [ "$mode" = "y" ]; then
+        : # auto-reset
+    elif [ "$mode" = "n" ]; then
+        return 1
+    else
+        hz_err "invalid HZ_RESET_ON_CRYPTFAIL value: '$mode' (use y or n)"
+        return 1
+    fi
+
+    hz_note "resetting server via hcloud: $target"
+    if ! hcloud server reset "$target" >/dev/null; then
+        hz_err "hcloud server reset failed"
+        return 1
+    fi
+
+    HZ_RESET_COUNT=$((HZ_RESET_COUNT + 1))
+    return 0
+}
+
+hz_unlock_and_wait() {
+    local ip=$1
+
+    local start_time
+    start_time=$(date +%s)
+
+    local last_socket=""
+    local luks_pass=""
+
+    local user_perm_denied=0
+    local root_perm_denied=0
+    local probe_attempt=0
+
+    HZ_RESET_COUNT=${HZ_RESET_COUNT:-0}
+
+    while [ $(($(date +%s) - start_time)) -lt "$HZ_BOOT_WAIT" ]; do
+        ((probe_attempt++))
+
+        # Fast-path: intended user can login.
+        hz_have_tty && hz_note "probing SSH as '$HZ_INTENDED_USER'..."
+        if hz_can_login_user "$ip"; then
+            hz_have_tty && hz_note "boot complete, connecting..."
+            return 0
+        fi
+
+        # Classify errors periodically so we don't spin forever on key/hostkey issues.
+        local user_probe
+        user_probe=$(hz_ssh_probe "$ip" "$HZ_INTENDED_USER" "$HZ_HOST_ALIAS" "true" || true)
+        if printf "%s" "$user_probe" | grep -qiE 'host key verification failed|remote host identification has changed'; then
+            if hz_report_hostkey_failure "$user_probe" "$ip"; then
+                continue
+            fi
+            return 1
+        fi
+        if printf "%s" "$user_probe" | grep -qi 'permission denied'; then
+            ((user_perm_denied++))
+        fi
+
+        hz_have_tty && hz_note "probing SSH as 'root'..."
+        local root_probe
+        root_probe=$(hz_ssh_probe "$ip" "root" "$HZ_HOST_ALIAS" "true" || true)
+        if printf "%s" "$root_probe" | grep -qiE 'host key verification failed|remote host identification has changed'; then
+            if hz_report_hostkey_failure "$root_probe" "$ip"; then
+                continue
+            fi
+            return 1
+        fi
+        if printf "%s" "$root_probe" | grep -qi 'permission denied'; then
+            ((root_perm_denied++))
+        fi
+
+        # Fast-fail: if both user and root got permission denied on first probe,
+        # the keys are clearly not accepted. No need to retry 3 times.
+        if [ "$probe_attempt" -eq 1 ] && [ "$user_perm_denied" -ge 1 ] && [ "$root_perm_denied" -ge 1 ]; then
+            hz_err "port 22 is reachable but SSH keys were rejected"
+            hz_err "neither '$HZ_INTENDED_USER' nor 'root' accepted your key"
+            return 1
+        fi
+
+        if [ "$user_perm_denied" -ge 3 ] && [ "$root_perm_denied" -ge 3 ]; then
+            hz_err "port 22 is reachable but SSH keys were rejected"
+            hz_err "neither '$HZ_INTENDED_USER' nor 'root' accepted your key"
+            return 1
+        fi
+
+        # If root is reachable and we're in initramfs, try unlock.
+        if hz_can_login_root "$ip"; then
+            if hz_check_unlocked_mapper "$ip"; then
+                hz_have_tty && hz_note "LUKS already unlocked, waiting for boot..."
+                sleep 3
+                continue
+            fi
+
+            local socket_path
+            socket_path=$(hz_find_askpass_socket "$ip")
+            socket_path=$(printf "%s" "$socket_path" | tr -d '\r\n')
+
+            if [ -n "$socket_path" ] && [ "$socket_path" != "$last_socket" ]; then
+                if [ -n "$last_socket" ]; then
+                    hz_have_tty && hz_warn "previous unlock attempt failed, retrying..."
+                else
+                    hz_have_tty && hz_note "server is at LUKS unlock prompt"
+                fi
+                if [ -z "$luks_pass" ]; then
+                    if ! luks_pass=$(hz_read_luks_passphrase); then
+                        return 1
+                    fi
+                fi
+                hz_have_tty && hz_note "sending passphrase..."
+                hz_send_unlock "$ip" "$socket_path" "$luks_pass"
+                last_socket=$socket_path
+                hz_have_tty && hz_note "waiting for boot..."
+                sleep 2
+                continue
+            fi
+
+            # If cryptsetup already failed (too many attempts), there may be no ask-password socket anymore.
+            # Provide a clear message instead of waiting until HZ_BOOT_WAIT.
+            if [ -z "$socket_path" ] && hz_cryptsetup_unit_failed "$ip"; then
+                hz_err "LUKS unlock prompt is no longer active (cryptsetup unit failed)"
+
+                if [ -n "${HZ_LUKS_UNLOCK:-}" ] || [ -n "${HZ_LUKS_SECRET_REF:-}" ]; then
+                    hz_err "note: verify your LUKS passphrase / op:// reference is correct"
+                fi
+
+                if hz_reset_server "$HZ_HOST_ALIAS"; then
+                    # Give the reboot a moment, then keep waiting.
+                    last_socket=""
+                    sleep 8
+                    continue
+                fi
+
+                hz_err "hard reset the VM to retry unlock, or unlock via console"
+                return 1
+            fi
+        fi
+
+        sleep 3
+    done
+
+    hz_err "timeout waiting for unlock/boot completion (HZ_BOOT_WAIT=$HZ_BOOT_WAIT)"
+    return 1
+}
+
+hz_exec_user_ssh() {
+    local ip=$1
+
+    local dest_out=$HZ_DEST_TOKEN
+
+    if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+        # rDNS mode - let SSH resolve the hostname naturally for config matching
+        # shellcheck disable=SC2086
+        exec $HZ_SSH_CMD \
+            ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+            ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+            "$dest_out" \
+            ${HZ_REMOTE_CMD[@]+"${HZ_REMOTE_CMD[@]}"}
+    else
+        local ipv_flag
+        ipv_flag=$(hz_ssh_ipv_flag "$ip")
+
+        # shellcheck disable=SC2086
+        exec $HZ_SSH_CMD \
+            ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+            ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+            ${ipv_flag:++$ipv_flag} \
+            -o "HostName=$ip" \
+            "$dest_out" \
+            ${HZ_REMOTE_CMD[@]+"${HZ_REMOTE_CMD[@]}"}
+    fi
+}
+
+hz_show_help() {
+    cat <<'EOF'
+hz - Hetzner VM SSH/SCP helper with LUKS auto-unlock
+
+Usage:
+  hz ssh [ssh_args...] [user@]server [remote_command...]
+  hz scp [scp_args...] source... destination
+
+Subcommands:
+  ssh   Connect via SSH (supports auto LUKS unlock)
+  scp   Copy files via SCP (supports auto LUKS unlock)
+
+SCP path format:
+  localpath                    Local file or directory
+  [user@]hetzner-vm:path       Remote path (VM name/ID resolved via hcloud)
+  [user@]hostname:path         Remote path (passed through to scp)
+
+Environment variables:
+  HZ_LUKS_UNLOCK        LUKS passphrase or op:// reference
+  HZ_OP_ACCOUNT         Optional 1Password account selector
+  HZ_SSH_STRICT         y (default) = normal host key checking; n = disable
+  HZ_RDNS               y = use rDNS hostname; n (default) = use VM name
+  HZ_CONNECT_WAIT       Seconds to wait for TCP/22 (default: 120)
+  HZ_BOOT_WAIT          Max seconds for unlock+boot (default: 600)
+  HZ_RESET_ON_CRYPTFAIL y = auto-reset on crypt fail; n = fail; unset = prompt
+  HZ_RESET_MAX          Max resets per run (default: 1)
+  HZ_SSH_CMD            Override SSH binary (default: ssh)
+  HZ_SCP_CMD            Override SCP binary (default: scp)
+
+Examples:
+  hz ssh myuser@hetzner-vm
+  hz ssh -A hetzner-vm 'ssh-add -l'
+  hz scp localfile.txt myuser@hetzner-vm:/tmp/
+  hz scp myuser@hetzner-vm:/etc/hosts ./
+  hz scp -r myuser@hetzner-vm:/var/log/ ./logs/
+EOF
+}
+
+hz_require_common_cmds() {
+    hz_require_cmd "$HZ_SSH_CMD"
+    hz_require_cmd "$HZ_SSH_KEYSCAN_CMD"
+    hz_require_cmd "$HZ_SSH_KEYGEN_CMD"
+    hz_require_cmd awk
+    hz_require_cmd mktemp
+    hz_require_cmd tr
+    hz_require_cmd nc
+    hz_require_cmd hcloud
+    hz_require_cmd jq
+    hz_require_cmd op
+}
+
+hz_cmd_ssh() {
+    hz_require_common_cmds
+
+    if ! hz_parse_ssh_args "$@"; then
+        if [ $# -gt 0 ]; then
+            exec $HZ_SSH_CMD "$@"
+        fi
+        hz_err "usage: hz ssh [ssh_args...] [user@]server [remote_command...]"
+        exit 1
+    fi
+
+    hz_build_ssh_common_args
+
+    local connect_ip=""
+
+    # If hcloud lookup fails, fall back to the host as provided.
+    if hz_resolve_hcloud_ips "$HZ_HOST_ALIAS"; then
+        if ! hz_select_connect_ip "$HZ_FORCED_FAMILY"; then
+            exit 1
+        fi
+        connect_ip=$HZ_CONNECT_IP
+
+        # Optionally use rDNS for SSH config matching
+        if [ "$HZ_RDNS" = "y" ]; then
+            local rdns_host
+            if rdns_host=$(hz_rdns_lookup "$connect_ip"); then
+                # Update destination to use rDNS hostname
+                hz_have_tty && hz_note "using rDNS hostname: $rdns_host"
+                HZ_DEST_TOKEN="${HZ_INTENDED_USER}@${rdns_host}"
+                HZ_HOST_ALIAS=$rdns_host
+                # Let SSH resolve the rDNS hostname naturally (no HostName override)
+                # This allows SSH config matching to work properly
+                HZ_SKIP_HOSTNAME_OVERRIDE=y
+            fi
+        fi
+    else
+        # No hcloud metadata; just try the host alias directly.
+        hz_have_tty && hz_note "not a Hetzner server, treating '$HZ_HOST_ALIAS' as hostname..."
+        connect_ip=$HZ_HOST_ALIAS
+        if [ -n "$HZ_FORCED_FAMILY" ]; then
+            hz_warn "-4/-6 provided but target isn't a Hetzner server name/id"
+        fi
+        # Quick connectivity check to catch DNS failures fast (before the longer wait loop)
+        local nc_flag
+        nc_flag=$(hz_nc_ipv_flag "$connect_ip")
+        local nc_err
+        if ! nc_err=$(nc "$nc_flag" -z -w 2 "$connect_ip" 22 2>&1); then
+            if printf "%s" "$nc_err" | grep -qi 'getaddrinfo\|nodename\|not known\|Could not resolve'; then
+                hz_err "unknown host: $connect_ip"
+                exit 1
+            fi
+        fi
+        if ! hz_wait_for_port "$connect_ip" "$HZ_CONNECT_WAIT"; then
+            hz_err "timeout waiting for SSH port 22 on $connect_ip"
+            exit 1
+        fi
+    fi
+
+    # Run the SSH command directly (without exec) so we can check for LUKS unlock.
+    # If it fails with exit code 255, enter unlock flow and retry.
+    local ipv_flag
+    ipv_flag=$(hz_ssh_ipv_flag "$connect_ip")
+
+    local ssh_ret=0
+    set +e
+    if [ ${#HZ_REMOTE_CMD[@]} -eq 0 ]; then
+        # Interactive session - run without exec so we can retry on LUKS
+        # shellcheck disable=SC2086
+        if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+            $HZ_SSH_CMD \
+                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                "$HZ_DEST_TOKEN"
+        else
+            $HZ_SSH_CMD \
+                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                ${ipv_flag:++$ipv_flag} \
+                -o "HostName=$connect_ip" \
+                "$HZ_DEST_TOKEN"
+        fi
+        ssh_ret=$?
+    else
+        # Non-interactive: run the actual command
+        # shellcheck disable=SC2086
+        if [ "${HZ_SKIP_HOSTNAME_OVERRIDE:-}" = "y" ]; then
+            $HZ_SSH_CMD \
+                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                ${HZ_STRICT_KEYCHECK_OPT} \
+                -o BatchMode=yes \
+                -o ConnectTimeout=10 \
+                "$HZ_DEST_TOKEN" \
+                "${HZ_REMOTE_CMD[@]}"
+        else
+            $HZ_SSH_CMD \
+                ${HZ_SSH_OPTS[@]+"${HZ_SSH_OPTS[@]}"} \
+                ${HZ_COMMON_SSH_ARGS[@]+"${HZ_COMMON_SSH_ARGS[@]}"} \
+                ${HZ_STRICT_KEYCHECK_OPT} \
+                -o BatchMode=yes \
+                -o ConnectTimeout=10 \
+                ${ipv_flag:++$ipv_flag} \
+                -o "HostName=$connect_ip" \
+                "$HZ_DEST_TOKEN" \
+                "${HZ_REMOTE_CMD[@]}"
+        fi
+        ssh_ret=$?
+    fi
+    set -e
+
+    # Success or non-connection error: done
+    if [ $ssh_ret -ne 255 ]; then
+        exit $ssh_ret
+    fi
+
+    # Exit code 255: connection/auth/hostkey error. Attempt unlock flow.
+    hz_have_tty && hz_note "SSH connection failed, checking for LUKS unlock prompt..."
+    if ! hz_unlock_and_wait "$connect_ip"; then
+        exit 1
+    fi
+
+    hz_exec_user_ssh "$connect_ip"
+}
+
+# Parse a remote path in scp format: [user@]host:path
+# Sets globals:
+#   HZ_PATH_TYPE    - "local" or "remote"
+#   HZ_PATH_USER    - username (empty if not specified)
+#   HZ_PATH_HOST    - hostname/IP
+#   HZ_PATH_REMOTE  - remote path portion
+hz_parse_remote_path() {
+    local path=$1
+
+    HZ_PATH_TYPE=""
+    HZ_PATH_USER=""
+    HZ_PATH_HOST=""
+    HZ_PATH_REMOTE=""
+
+    # Check for remote path pattern: contains ':' but isn't a Windows drive letter
+    # Windows paths look like C:\... or C:/...
+    # Remote paths look like host:path or user@host:path
+    if [[ "$path" =~ ^[A-Za-z]:[/\\] ]]; then
+        # Windows drive letter - treat as local
+        HZ_PATH_TYPE="local"
+        return 0
+    fi
+
+    if [[ "$path" == *:* ]]; then
+        # Remote path
+        HZ_PATH_TYPE="remote"
+        local user_host=${path%%:*}
+        HZ_PATH_REMOTE=${path#*:}
+
+        if [[ "$user_host" == *@* ]]; then
+            HZ_PATH_USER=${user_host%%@*}
+            HZ_PATH_HOST=${user_host#*@}
+        else
+            HZ_PATH_USER=""
+            HZ_PATH_HOST=$user_host
+        fi
+
+        # Strip brackets from IPv6 addresses
+        HZ_PATH_HOST=$(hz_strip_brackets "$HZ_PATH_HOST")
+        return 0
+    fi
+
+    # Local path
+    HZ_PATH_TYPE="local"
+    return 0
+}
+
+# Parse scp arguments
+# Sets globals:
+#   HZ_SCP_OPTS[]        - options to pass to scp
+#   HZ_SCP_PATHS[]       - source and destination paths
+#   HZ_SCP_FORCED_FAMILY - "-4" or "-6" if specified
+hz_parse_scp_args() {
+    HZ_SCP_OPTS=()
+    HZ_SCP_PATHS=()
+    HZ_SCP_FORCED_FAMILY=""
+
+    local expect_arg=""
+
+    while [ $# -gt 0 ]; do
+        local a=$1
+
+        if [ -n "$expect_arg" ]; then
+            HZ_SCP_OPTS+=("$a")
+            expect_arg=""
+            shift
+            continue
+        fi
+
+        case "$a" in
+            -4|-6)
+                HZ_SCP_FORCED_FAMILY=$a
+                HZ_SCP_OPTS+=("$a")
+                ;;
+            # Options that take an argument
+            -c|-D|-F|-i|-J|-l|-o|-P|-S)
+                HZ_SCP_OPTS+=("$a")
+                expect_arg="$a"
+                ;;
+            # Options with attached value (e.g., -P22)
+            -c*|-D*|-F*|-i*|-J*|-l*|-o*|-P*|-S*)
+                HZ_SCP_OPTS+=("$a")
+                ;;
+            # Boolean options
+            -3|-A|-B|-C|-p|-q|-r|-T|-v|-X)
+                HZ_SCP_OPTS+=("$a")
+                ;;
+            --)
+                shift
+                # Rest are paths
+                while [ $# -gt 0 ]; do
+                    HZ_SCP_PATHS+=("$1")
+                    shift
+                done
+                break
+                ;;
+            -*)
+                # Unknown option - pass through
+                HZ_SCP_OPTS+=("$a")
+                ;;
+            *)
+                # Not an option - it's a path
+                HZ_SCP_PATHS+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    if [ ${#HZ_SCP_PATHS[@]} -lt 2 ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Resolve a Hetzner VM in an scp path
+# Usage: hz_resolve_scp_path <path> <default_user>
+# Sets globals:
+#   HZ_RESOLVED_PATH     - The resolved path (with IP if Hetzner VM)
+#   HZ_RESOLVED_IS_HETZNER - "y" if it was a Hetzner VM, "n" otherwise
+#   HZ_RESOLVED_IP       - IP address (only if Hetzner VM)
+#   HZ_RESOLVED_HOST     - Original hostname (only if Hetzner VM)
+#   HZ_RESOLVED_USER     - Username (only if Hetzner VM)
+# Returns 0 on success, 1 on error
+hz_resolve_scp_path() {
+    local path=$1
+    local default_user=$2
+
+    HZ_RESOLVED_PATH=""
+    HZ_RESOLVED_IS_HETZNER="n"
+    HZ_RESOLVED_IP=""
+    HZ_RESOLVED_HOST=""
+    HZ_RESOLVED_USER=""
+
+    hz_parse_remote_path "$path"
+
+    if [ "$HZ_PATH_TYPE" = "local" ]; then
+        HZ_RESOLVED_PATH=$path
+        return 0
+    fi
+
+    # Try to resolve as Hetzner VM
+    local host=$HZ_PATH_HOST
+    local user=${HZ_PATH_USER:-$default_user}
+    local remote_path=$HZ_PATH_REMOTE
+
+    if hz_resolve_hcloud_ips "$host"; then
+        # It's a Hetzner VM - resolve IP
+        if ! hz_select_connect_ip "$HZ_SCP_FORCED_FAMILY"; then
+            hz_err "failed to get IP for Hetzner VM: $host"
+            return 1
+        fi
+
+        # Store resolution info for unlock flow
+        HZ_RESOLVED_IS_HETZNER="y"
+        HZ_RESOLVED_IP=$HZ_CONNECT_IP
+        HZ_RESOLVED_HOST=$host
+        HZ_RESOLVED_USER=$user
+
+        # Build resolved path
+        HZ_RESOLVED_PATH="${user}@${HZ_CONNECT_IP}:${remote_path}"
+        return 0
+    fi
+
+    # Not a Hetzner VM - pass through unchanged
+    HZ_RESOLVED_PATH=$path
+    return 0
+}
+
+# Ensure a server is ready (unlocked and booted)
+# Usage: hz_ensure_server_ready <ip> <host_alias> <user>
+hz_ensure_server_ready() {
+    local ip=$1
+    local host_alias=$2
+    local user=$3
+
+    # Save current globals and set up for unlock flow
+    local saved_host_alias=${HZ_HOST_ALIAS:-}
+    local saved_intended_user=${HZ_INTENDED_USER:-}
+
+    HZ_HOST_ALIAS=$host_alias
+    HZ_INTENDED_USER=$user
+
+    hz_build_ssh_common_args
+
+    # Check if user can login
+    if hz_can_login_user "$ip"; then
+        HZ_HOST_ALIAS=$saved_host_alias
+        HZ_INTENDED_USER=$saved_intended_user
+        return 0
+    fi
+
+    # Try unlock flow
+    hz_have_tty && hz_note "checking for LUKS unlock prompt on $host_alias..."
+    if ! hz_unlock_and_wait "$ip"; then
+        HZ_HOST_ALIAS=$saved_host_alias
+        HZ_INTENDED_USER=$saved_intended_user
+        return 1
+    fi
+
+    HZ_HOST_ALIAS=$saved_host_alias
+    HZ_INTENDED_USER=$saved_intended_user
+    return 0
+}
+
+hz_cmd_scp() {
+    hz_require_common_cmds
+    hz_require_cmd "$HZ_SCP_CMD"
+
+    if ! hz_parse_scp_args "$@"; then
+        hz_err "usage: hz scp [scp_args...] source... destination"
+        exit 1
+    fi
+
+    local default_user=${USER:-}
+    if [ -z "$default_user" ]; then
+        hz_err "could not determine default user (USER is empty)"
+        exit 1
+    fi
+
+    # Resolve paths and collect Hetzner VMs that may need unlock
+    local resolved_paths=()
+    local hetzner_vms=()      # "ip:host:user" entries for VMs found
+    local seen_vms=""         # Track unique VMs
+
+    for path in "${HZ_SCP_PATHS[@]}"; do
+        if ! hz_resolve_scp_path "$path" "$default_user"; then
+            # Error during resolution
+            exit 1
+        fi
+
+        resolved_paths+=("$HZ_RESOLVED_PATH")
+
+        if [ "$HZ_RESOLVED_IS_HETZNER" = "y" ]; then
+            # It was a Hetzner VM - track for potential unlock
+            local vm_key="${HZ_RESOLVED_IP}:${HZ_RESOLVED_HOST}"
+            if [[ "$seen_vms" != *"$vm_key"* ]]; then
+                hetzner_vms+=("${HZ_RESOLVED_IP}:${HZ_RESOLVED_HOST}:${HZ_RESOLVED_USER}")
+                seen_vms="$seen_vms $vm_key"
+            fi
+        fi
+    done
+
+    # Build scp common args (similar to ssh)
+    local scp_common_args=()
+    if [ "${HZ_SSH_STRICT}" = "n" ]; then
+        scp_common_args+=(
+            -o StrictHostKeyChecking=no
+            -o UserKnownHostsFile=/dev/null
+        )
+    fi
+
+    # Fast path: try scp directly first
+    set +e
+    # shellcheck disable=SC2086
+    $HZ_SCP_CMD \
+        ${HZ_SCP_OPTS[@]+"${HZ_SCP_OPTS[@]}"} \
+        ${scp_common_args[@]+"${scp_common_args[@]}"} \
+        "${resolved_paths[@]}"
+    local scp_ret=$?
+    set -e
+
+    if [ $scp_ret -eq 0 ]; then
+        exit 0
+    fi
+
+    # If no Hetzner VMs involved, just fail with scp's exit code
+    if [ ${#hetzner_vms[@]} -eq 0 ]; then
+        exit $scp_ret
+    fi
+
+    # scp failed - check if any VMs need unlock
+    hz_have_tty && hz_note "SCP failed, checking if servers need LUKS unlock..."
+
+    hz_build_ssh_common_args
+
+    for vm_entry in "${hetzner_vms[@]}"; do
+        local vm_ip=${vm_entry%%:*}
+        local rest=${vm_entry#*:}
+        local vm_host=${rest%%:*}
+        local vm_user=${rest#*:}
+
+        if ! hz_ensure_server_ready "$vm_ip" "$vm_host" "$vm_user"; then
+            hz_err "failed to unlock/connect to $vm_host"
+            exit 1
+        fi
+    done
+
+    # Retry scp after unlock
+    hz_have_tty && hz_note "retrying SCP..."
+    # shellcheck disable=SC2086
+    exec $HZ_SCP_CMD \
+        ${HZ_SCP_OPTS[@]+"${HZ_SCP_OPTS[@]}"} \
+        ${scp_common_args[@]+"${scp_common_args[@]}"} \
+        "${resolved_paths[@]}"
+}
+
+main() {
+    case "${1:-}" in
+        ssh)
+            shift
+            hz_cmd_ssh "$@"
+            ;;
+        scp)
+            shift
+            hz_cmd_scp "$@"
+            ;;
+        -h|--help)
+            hz_show_help
+            exit 0
+            ;;
+        "")
+            hz_err "missing subcommand"
+            hz_show_help
+            exit 1
+            ;;
+        *)
+            hz_err "unknown subcommand: $1"
+            hz_show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
